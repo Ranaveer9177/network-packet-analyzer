@@ -1,160 +1,139 @@
-import sys
 from scapy.all import rdpcap, IP, TCP, UDP, Raw
 from collections import defaultdict
 
+# Load packets
+packets = rdpcap("capture.pcap")
 
-def main():
-    # Load packets (accept filename from command line or default)
-    if len(sys.argv) > 1:
-        pcap_file = sys.argv[1]
-    else:
-        pcap_file = "capture.pcap"
+# Data structures
+ip_times = defaultdict(list)
+port_tracker = defaultdict(set)
+syn_count = defaultdict(int)
 
-    print(f"📂 Loading packets from: {pcap_file}\n")
-    packets = rdpcap(pcap_file)
+# Store HTTP data
+http_data = []
 
-    # Data structures
-    ip_times = defaultdict(list)
-    port_tracker = defaultdict(set)
-    syn_count = defaultdict(int)
+# Trusted networks (CDNs / big providers)
+trusted_prefixes = (
+    "142.251.", "172.217.", "216.239.",   # Google
+    "104.18.", "104.17.",                 # Cloudflare
+    "151.101.", "199.232.",               # Fastly
+)
 
-    # Store HTTP data
-    http_data = []
+# Process packets
+for pkt in packets:
+    if pkt.haslayer(IP):
+        src = pkt[IP].src
+        time = pkt.time
 
-    # Trusted networks (CDNs / big providers)
-    trusted_prefixes = (
-        "142.251.", "172.217.", "216.239.",   # Google
-        "104.18.", "104.17.",                 # Cloudflare
-        "151.101.", "199.232.",               # Fastly
-    )
+        # Skip trusted traffic
+        if src.startswith(trusted_prefixes):
+            continue
 
-    # Process packets
-    for pkt in packets:
-        if pkt.haslayer(IP):
-            src = pkt[IP].src
-            time = pkt.time
+        ip_times[src].append(time)
 
-            # Skip trusted traffic
-            if src.startswith(trusted_prefixes):
-                continue
+        # TCP handling
+        if pkt.haslayer(TCP):
+            dport = pkt[TCP].dport
+            flags = pkt[TCP].flags
 
-            ip_times[src].append(time)
+            port_tracker[src].add(dport)
 
-            # TCP handling
-            if pkt.haslayer(TCP):
-                dport = pkt[TCP].dport
-                flags = pkt[TCP].flags
+            # SYN detection (correct)
+            if flags & 0x02:
+                syn_count[src] += 1
 
-                port_tracker[src].add(dport)
+        # UDP handling (important addition)
+        if pkt.haslayer(UDP):
+            dport = pkt[UDP].dport
+            port_tracker[src].add(dport)
 
-                # SYN detection (correct)
-                if flags & 0x02:
-                    syn_count[src] += 1
+        # HTTP extraction (improved)
+        if pkt.haslayer(Raw):
+            try:
+                payload = pkt[Raw].load.decode(errors="ignore")
+                if payload.startswith(("GET", "POST", "HTTP/")):
+                    http_data.append((src, payload[:200]))
+            except:
+                pass
 
-            # UDP handling (important addition)
-            if pkt.haslayer(UDP):
-                dport = pkt[UDP].dport
-                port_tracker[src].add(dport)
+print("\n--- Analysis Report ---\n")
 
-            # HTTP extraction (improved)
-            if pkt.haslayer(Raw):
-                try:
-                    payload = pkt[Raw].load.decode(errors="ignore")
-                    if payload.startswith(("GET", "POST", "HTTP/")):
-                        http_data.append((src, payload[:200]))
-                except Exception:
-                    pass
+alerts_found = False
 
-    print("\n--- Analysis Report ---\n")
+# Write to file
+with open("report.txt", "w") as f:
 
-    alerts_found = False
-    skipped_ips = 0
+    f.write("--- Analysis Report ---\n\n")
 
-    # Write to file
-    with open("report.txt", "w") as f:
+    for ip in ip_times:
+        times = ip_times[ip]
 
-        f.write("--- Analysis Report ---\n\n")
+        if len(times) < 10:
+            continue
 
-        for ip in ip_times:
-            times = ip_times[ip]
+        duration = max(times) - min(times)
+        rate = len(times) / duration if duration > 0 else 0
 
-            if len(times) < 10:
-                skipped_ips += 1
-                continue
+        unique_ports = len(port_tracker[ip])
+        syns = syn_count[ip]
 
-            duration = max(times) - min(times)
-            rate = len(times) / duration if duration > 0 else 0
+        # Debug info
+        debug_msg = (
+            f"[DEBUG] IP: {ip} | Packets: {len(times)} | "
+            f"Rate: {rate:.2f} | Ports: {unique_ports} | SYN: {syns}\n"
+        )
+        print(debug_msg)
+        f.write(debug_msg)
 
-            unique_ports = len(port_tracker[ip])
-            syns = syn_count[ip]
+        alert = None
 
-            # Debug info
-            debug_msg = (
-                f"[DEBUG] IP: {ip} | Packets: {len(times)} | "
-                f"Rate: {rate:.2f} | Ports: {unique_ports} | SYN: {syns}\n"
+        # 🚨 Detection Logic (ordered correctly)
+
+        # 🔴 Internal threat (highest priority inside LAN)
+        if ip.startswith("192.168.") and unique_ports > 15:
+            alert = f"Internal Port Scan from {ip}"
+
+        # 🔴 SYN Flood
+        elif syns > 50 and unique_ports < 10:
+            alert = f"SYN Flood from {ip}"
+
+        # 🔴 DoS Attack
+        elif rate > 50 and syns > 20:
+            alert = f"Likely DoS Attack from {ip}"
+
+        # 🟠 High Traffic Anomaly
+        elif rate > 150 and unique_ports <= 3:
+            alert = f"High Traffic Anomaly from {ip}"
+
+        # 🟠 Port Scanning
+        elif unique_ports > 10:
+            alert = f"Port Scanning from {ip}"
+
+        # Print alerts
+        if alert:
+            alert_msg = (
+                f"⚠️ {alert} | Rate: {rate:.2f} | "
+                f"Ports: {unique_ports} | SYN: {syns}\n"
             )
-            print(debug_msg)
-            f.write(debug_msg)
+            print(alert_msg)
+            f.write(alert_msg)
+            alerts_found = True
 
-            alert = None
+    # 🌐 HTTP Data Section
+    if http_data:
+        print("\n🌐 HTTP Traffic Found:\n")
+        f.write("\nHTTP Traffic Found:\n\n")
 
-            # 🚨 Detection Logic (ordered correctly)
+        for src, data in http_data[:5]:
+            print(f"IP: {src}")
+            print(data)
+            print("-" * 50)
 
-            # 🔴 Internal threat (highest priority inside LAN)
-            if ip.startswith("192.168.") and unique_ports > 15:
-                alert = f"Internal Port Scan from {ip}"
+            f.write(f"IP: {src}\n{data}\n{'-'*50}\n")
 
-            # 🔴 SYN Flood
-            elif syns > 50 and unique_ports < 10:
-                alert = f"SYN Flood from {ip}"
+    # No alerts case
+    if not alerts_found:
+        print("✅ No suspicious activity detected.")
+        f.write("No suspicious activity detected.\n")
 
-            # 🔴 DoS Attack
-            elif rate > 50 and syns > 20:
-                alert = f"Likely DoS Attack from {ip}"
-
-            # 🟠 High Traffic Anomaly
-            elif rate > 150 and unique_ports <= 3:
-                alert = f"High Traffic Anomaly from {ip}"
-
-            # 🟠 Port Scanning
-            elif unique_ports > 10:
-                alert = f"Port Scanning from {ip}"
-
-            # Print alerts
-            if alert:
-                alert_msg = (
-                    f"⚠️ {alert} | Rate: {rate:.2f} | "
-                    f"Ports: {unique_ports} | SYN: {syns}\n"
-                )
-                print(alert_msg)
-                f.write(alert_msg)
-                alerts_found = True
-
-        # Show skipped IPs info
-        if skipped_ips > 0:
-            skip_msg = f"\nℹ️ {skipped_ips} IP(s) skipped (fewer than 10 packets).\n"
-            print(skip_msg)
-            f.write(skip_msg)
-
-        # 🌐 HTTP Data Section
-        if http_data:
-            print("\n🌐 HTTP Traffic Found:\n")
-            f.write("\nHTTP Traffic Found:\n\n")
-
-            for src, data in http_data[:5]:
-                print(f"IP: {src}")
-                print(data)
-                print("-" * 50)
-
-                f.write(f"IP: {src}\n{data}\n{'-'*50}\n")
-
-        # No alerts case
-        if not alerts_found:
-            print("✅ No suspicious activity detected.")
-            f.write("No suspicious activity detected.\n")
-
-    print("\n📁 Report saved to report.txt")
-
-
-if __name__ == "__main__":
-    main()
+print("\n📁 Report saved to report.txt")
